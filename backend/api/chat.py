@@ -413,7 +413,6 @@ async def stream_chat(
         # Execute each tool and collect results
         tool_results = []
         for block in tool_use_blocks:
-            yield sse({"type": "tool_start", "name": block["name"], "input": block["input"]})
             result = await dispatch_tool(block["name"], block["input"], account_id, db, base_url)
             yield sse({"type": "tool_result", "name": block["name"], "result": result})
             tool_results.append({
