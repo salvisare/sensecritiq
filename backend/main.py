@@ -1,3 +1,8 @@
+"""
+SenseCritiq Backend — main.py
+Includes Phase 1 routers + Phase 2 chat router.
+"""
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -5,29 +10,31 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from databases import Database
 import os
-from api.sessions import router as sessions_router
-from api.stubs import router as stubs_router
-from api.billing import router as billing_router
-from api.portal import router as portal_router
-from api.chat import router as chat_router
 
+# ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="SenseCritiq API",
-    description="UX research synthesis backend — ingests research artifacts, produces structured insights.",
-    version="0.1.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    version="2.0.0",
+    description="UX research synthesis backend — MCP + Web Chat",
 )
 
+# ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://sensecritiq-portal.vercel.app",
+        "https://sensecritiq.com",
+        "https://app.sensecritiq.com",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Database (needed by chat endpoint) ───────────────────────
-database = Database(os.environ["DATABASE_URL"])
+# ── Database ──────────────────────────────────────────────────────────────────
+DATABASE_URL = os.environ["DATABASE_URL"]
+database = Database(DATABASE_URL)
 
 @app.on_event("startup")
 async def startup():
@@ -38,12 +45,20 @@ async def startup():
 async def shutdown():
     await database.disconnect()
 
+# ── Routers ───────────────────────────────────────────────────────────────────
+from api.sessions import router as sessions_router
+from api.stubs import router as stubs_router
+from api.billing import router as billing_router
+from api.portal import router as portal_router
+from api.chat import router as chat_router        # Phase 2
+
 app.include_router(sessions_router, prefix="/v1")
 app.include_router(stubs_router)
 app.include_router(billing_router)
 app.include_router(portal_router)
-app.include_router(chat_router)
+app.include_router(chat_router)                   # /v1/chat, /v1/conversations
 
-@app.get("/health", tags=["meta"])
+# ── Health ────────────────────────────────────────────────────────────────────
+@app.get("/health")
 async def health():
-    return {"status": "ok", "service": "sensecritiq-api"}
+    return {"status": "ok", "version": "2.0.0"}

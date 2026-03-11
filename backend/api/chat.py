@@ -13,10 +13,13 @@ import json
 import os
 import asyncio
 from typing import AsyncIterator, Optional
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import anthropic
+import boto3
+import uuid
+import modal
 from databases import Database
 
 router = APIRouter()
@@ -462,6 +465,62 @@ async def chat_endpoint(
             "Access-Control-Allow-Origin": "*",
         },
     )
+
+
+# ── Web file upload endpoint ──────────────────────────────────────────────────
+@router.post("/v1/upload")
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(...),
+    session_name: str = Form(...),
+    account_id: str = Depends(get_account_id),
+):
+    """
+    Accepts a multipart file upload from the browser, stores it in R2,
+    creates a session record, and spawns the Modal pipeline.
+    Returns session_id immediately so the frontend can poll status.
+    """
+    db: Database = request.app.state.db
+
+    # Read file bytes
+    contents = await file.read()
+    filename = file.filename or "upload"
+    session_id = str(uuid.uuid4())
+
+    # Upload to R2
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=os.environ["R2_ENDPOINT_URL"],
+        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+    )
+    s3_key = f"uploads/{account_id}/{session_id}/{filename}"
+    s3.put_object(
+        Bucket=os.environ["R2_BUCKET_NAME"],
+        Key=s3_key,
+        Body=contents,
+        ContentType=file.content_type or "application/octet-stream",
+    )
+
+    # Create session record
+    await db.execute(
+        """INSERT INTO sessions
+               (id, account_id, name, status, file_s3_key, created_at)
+           VALUES (:id, :account_id, :name, 'queued', :s3_key, NOW())""",
+        {"id": session_id, "account_id": account_id,
+         "name": session_name, "s3_key": s3_key},
+    )
+
+    # Spawn Modal pipeline
+    try:
+        process_session = modal.Function.from_name(
+            "sensecritiq-pipeline", "process_session"
+        )
+        await process_session.spawn.aio(session_id, s3_key, filename)
+    except Exception as e:
+        print(f"[upload] Modal spawn failed: {e}")
+
+    return JSONResponse({"session_id": session_id, "status": "queued"})
 
 
 # ── Conversations list endpoint ───────────────────────────────────────────────
