@@ -21,3 +21,4 @@ node_modules/
 # IDE
 .DS_Store
 .vscode/
+.mcpregistry_github_token
