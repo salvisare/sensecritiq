@@ -173,8 +173,9 @@ async def get_account_id(request: Request) -> str:
 
     token = auth_header[len("Bearer "):]
 
-    # Clerk JWT (longer, contains dots)
-    if token.count(".") == 2:
+    # Clerk JWT has 3 parts separated by 2 dots (header.payload.signature)
+    # API keys start with scq_
+    if not token.startswith("scq_"):
         from api.portal import _verify_clerk_token
         try:
             user_info = await _verify_clerk_token(request)
