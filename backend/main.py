@@ -3,6 +3,8 @@ load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from databases import Database
+import os
 from api.sessions import router as sessions_router
 from api.stubs import router as stubs_router
 from api.billing import router as billing_router
@@ -23,6 +25,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Database (needed by chat endpoint) ───────────────────────
+database = Database(os.environ["DATABASE_URL"])
+
+@app.on_event("startup")
+async def startup():
+    await database.connect()
+    app.state.db = database
+
+@app.on_event("shutdown")
+async def shutdown():
+    await database.disconnect()
 
 app.include_router(sessions_router, prefix="/v1")
 app.include_router(stubs_router)
