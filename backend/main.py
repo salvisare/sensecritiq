@@ -7,6 +7,7 @@ from api.sessions import router as sessions_router
 from api.stubs import router as stubs_router
 from api.billing import router as billing_router
 from api.portal import router as portal_router
+from api.chat import router as chat_router
 
 app = FastAPI(
     title="SenseCritiq API",
@@ -27,6 +28,7 @@ app.include_router(sessions_router, prefix="/v1")
 app.include_router(stubs_router)
 app.include_router(billing_router)
 app.include_router(portal_router)
+app.include_router(chat_router)
 
 @app.get("/health", tags=["meta"])
 async def health():
