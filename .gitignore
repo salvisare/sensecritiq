@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+
+# Environment files — never commit these
+.env
+.env.*
+
+# Build
+build/
+dist/
+node_modules/
+
+# Railway / Vercel
+.vercel/
+.railway/
+
+# IDE
+.DS_Store
+.vscode/
