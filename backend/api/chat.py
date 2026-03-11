@@ -19,7 +19,6 @@ from pydantic import BaseModel
 import anthropic
 import boto3
 import uuid
-import modal
 from databases import Database
 
 router = APIRouter()
@@ -510,8 +509,9 @@ async def upload_file(
          "name": session_name, "s3_key": s3_key},
     )
 
-    # Spawn Modal pipeline
+    # Spawn Modal pipeline (lazy import — Modal auth not needed at startup)
     try:
+        import modal
         process_session = modal.Function.from_name(
             "sensecritiq-pipeline", "process_session"
         )
