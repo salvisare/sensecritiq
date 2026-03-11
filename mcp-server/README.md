@@ -1,5 +1,7 @@
 # SenseCritiq MCP Server
 
+mcp-name: io.github.salvisare/sensecritiq
+
 SenseCritiq turns raw research into actionable insights — automatically.
 
 Upload an interview recording, transcript, or survey and Claude will extract themes, surface verbatim quotes, and generate structured findings in minutes. No more manual affinity mapping. No more hours spent tagging transcripts. Just clear, cited insights ready to share with your team.

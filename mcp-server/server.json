@@ -1,0 +1,30 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.salvisare/sensecritiq",
+  "description": "UX research synthesis agent. Upload interviews and get themes, quotes, and findings.",
+  "repository": {
+    "url": "https://github.com/salvisare/sensecritiq",
+    "source": "github",
+    "subfolder": "mcp-server"
+  },
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "sensecritiq-mcp",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "description": "Your SenseCritiq API key. Get yours at sensecritiq.com",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true,
+          "name": "SCQ_API_KEY"
+        }
+      ]
+    }
+  ]
+}
