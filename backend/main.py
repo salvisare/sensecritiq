@@ -53,7 +53,7 @@ from api.portal import router as portal_router
 from api.chat import router as chat_router        # Phase 2
 
 app.include_router(sessions_router, prefix="/v1")
-app.include_router(stubs_router, prefix="/v1")
+app.include_router(stubs_router, prefix="/v1")    # stub routes under /v1 to match dispatch_tool calls
 app.include_router(billing_router)
 app.include_router(portal_router)
 app.include_router(chat_router)                   # /v1/chat, /v1/conversations

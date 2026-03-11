@@ -210,63 +210,125 @@ async def dispatch_tool(
     base_url: str,
 ) -> dict:
     """
-    Calls the appropriate backend service for each tool.
-    Returns a dict that Claude receives as the tool result.
+    Resolves tool calls directly against the database.
+    Avoids internal HTTP round-trips and auth complexity.
     """
-    import httpx
 
-    # For Phase 2 we route through the existing REST endpoints so we don't
-    # duplicate business logic. Internal calls skip auth by using a shared
-    # internal secret header (set via INTERNAL_SECRET env var).
-    headers = {
-        "X-Internal-Account-Id": account_id,
-        "X-Internal-Secret": os.environ.get("INTERNAL_SECRET", ""),
-    }
+    if tool_name == "upload_research_file":
+        # Handled via /v1/upload — this path is only hit if Claude calls the
+        # tool directly without a pre-uploaded file.
+        return {
+            "error": "File upload via tool not supported in web UI. "
+                     "Use the attachment button to upload a file."
+        }
 
-    async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=120) as client:
-        if tool_name == "upload_research_file":
-            resp = await client.post("/v1/sessions", json={
-                "file_path": tool_input["file_path"],
-                "session_name": tool_input["session_name"],
-                "project_id": tool_input.get("project_id"),
-                "tags": tool_input.get("tags", []),
-            })
-            return resp.json()
+    elif tool_name == "get_session_status":
+        sid = tool_input.get("session_id", "")
+        row = await db.fetch_one(
+            "SELECT id, status, quote_count, created_at, completed_at "
+            "FROM sessions WHERE id = :id AND account_id = :aid",
+            {"id": sid, "aid": account_id},
+        )
+        if not row:
+            return {"error": f"Session {sid} not found"}
+        return {
+            "session_id": sid,
+            "status": row["status"],
+            "progress_pct": 100 if row["status"] == "ready" else 0,
+            "completed_at": str(row["completed_at"]) if row["completed_at"] else None,
+        }
 
-        elif tool_name == "get_session_status":
-            resp = await client.get(f"/v1/sessions/{tool_input['session_id']}/status")
-            return resp.json()
-
-        elif tool_name == "get_synthesis":
-            resp = await client.get(f"/v1/sessions/{tool_input['session_id']}/synthesis")
-            return resp.json()
-
-        elif tool_name == "get_quotes":
-            params = {}
-            if "theme_id" in tool_input:
-                params["theme_id"] = tool_input["theme_id"]
-            resp = await client.get(f"/v1/sessions/{tool_input['session_id']}/quotes", params=params)
-            return resp.json()
-
-        elif tool_name == "search_research":
-            resp = await client.post("/v1/search", json=tool_input)
-            return resp.json()
-
-        elif tool_name == "list_sessions":
-            params = {
-                "limit": tool_input.get("limit", 20),
-                "offset": tool_input.get("offset", 0),
+    elif tool_name == "get_synthesis":
+        sid = tool_input.get("session_id", "")
+        row = await db.fetch_one(
+            "SELECT id, name, status, themes, findings, quote_count "
+            "FROM sessions WHERE id = :id AND account_id = :aid",
+            {"id": sid, "aid": account_id},
+        )
+        if not row:
+            return {"error": f"Session {sid} not found"}
+        if row["status"] != "ready":
+            return {
+                "session_id": sid,
+                "status": row["status"],
+                "message": "Session is still processing. Check back in a few minutes.",
             }
-            if "project_id" in tool_input:
-                params["project_id"] = tool_input["project_id"]
-            resp = await client.get("/v1/sessions", params=params)
-            return resp.json()
+        import json as _json
+        themes = row["themes"]
+        findings = row["findings"]
+        if isinstance(themes, str):
+            themes = _json.loads(themes)
+        if isinstance(findings, str):
+            findings = _json.loads(findings)
+        return {
+            "session_id": sid,
+            "session_name": row["name"],
+            "themes": themes or [],
+            "key_findings": findings or [],
+            "quote_count": row["quote_count"] or 0,
+        }
 
-        elif tool_name == "generate_report":
-            resp = await client.post(f"/v1/sessions/{tool_input['session_id']}/report", json={
-                "format": tool_input["format"],
+    elif tool_name == "get_quotes":
+        sid = tool_input.get("session_id", "")
+        try:
+            q = ("SELECT id, text, speaker, timestamp_sec, theme_label "
+                 "FROM quotes WHERE session_id = :sid")
+            params: dict = {"sid": sid}
+            if "theme_id" in tool_input:
+                # theme_id in the tool maps to theme_label in the DB
+                q += " AND theme_label = :tlabel"
+                params["tlabel"] = tool_input["theme_id"]
+            rows = await db.fetch_all(q, params)
+            quotes = [dict(r) for r in rows]
+        except Exception:
+            quotes = []
+        return {"quotes": quotes, "total": len(quotes)}
+
+    elif tool_name == "search_research":
+        import httpx
+        try:
+            async with httpx.AsyncClient(base_url=base_url, timeout=30) as client:
+                resp = await client.post("/v1/search", json=tool_input)
+                return resp.json()
+        except Exception as e:
+            return {"error": f"Search unavailable: {e}", "results": []}
+
+    elif tool_name == "list_sessions":
+        limit = int(tool_input.get("limit", 20))
+        offset = int(tool_input.get("offset", 0))
+        q = ("SELECT id, name, status, quote_count, created_at, completed_at "
+             "FROM sessions WHERE account_id = :aid")
+        params: dict = {"aid": account_id}
+        if "project_id" in tool_input:
+            q += " AND project_id = :pid"
+            params["pid"] = tool_input["project_id"]
+        q += " ORDER BY created_at DESC LIMIT :lim OFFSET :off"
+        params["lim"] = limit
+        params["off"] = offset
+        rows = await db.fetch_all(q, params)
+        sessions = []
+        for r in rows:
+            sessions.append({
+                "id": str(r["id"]),
+                "name": r["name"],
+                "status": r["status"],
+                "quote_count": r["quote_count"],
+                "created_at": str(r["created_at"]),
+                "completed_at": str(r["completed_at"]) if r["completed_at"] else None,
             })
-            return resp.json()
+        return {"sessions": sessions, "total": len(sessions)}
+
+    elif tool_name == "generate_report":
+        import httpx
+        try:
+            async with httpx.AsyncClient(base_url=base_url, timeout=60) as client:
+                resp = await client.post(
+                    f"/v1/sessions/{tool_input['session_id']}/report",
+                    json={"format": tool_input.get("format", "markdown")},
+                )
+                return resp.json()
+        except Exception as e:
+            return {"error": f"Report generation unavailable: {e}"}
 
     return {"error": f"Unknown tool: {tool_name}"}
 
