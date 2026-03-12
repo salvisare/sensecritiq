@@ -279,7 +279,16 @@ async def dispatch_tool(
                 q += " AND theme_label = :tlabel"
                 params["tlabel"] = tool_input["theme_id"]
             rows = await db.fetch_all(q, params)
-            quotes = [dict(r) for r in rows]
+            quotes = [
+                {
+                    "id": str(r["id"]),
+                    "text": r["text"],
+                    "speaker": r["speaker"],
+                    "timestamp_sec": r["timestamp_sec"],
+                    "theme_label": r["theme_label"],
+                }
+                for r in rows
+            ]
         except Exception:
             quotes = []
         return {"quotes": quotes, "total": len(quotes)}
