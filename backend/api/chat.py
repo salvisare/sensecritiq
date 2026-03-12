@@ -285,13 +285,83 @@ async def dispatch_tool(
         return {"quotes": quotes, "total": len(quotes)}
 
     elif tool_name == "search_research":
-        import httpx
+        # Direct DB search — ILIKE across quotes and session names
+        query: str = tool_input.get("query", "").strip()
+        if not query:
+            return {"query": query, "results": [], "total": 0}
+        pattern = f"%{query}%"
+        results = []
         try:
-            async with httpx.AsyncClient(base_url=base_url, timeout=30) as client:
-                resp = await client.post("/v1/search", json=tool_input)
-                return resp.json()
+            q = """
+                SELECT
+                    qt.text, qt.speaker, qt.timestamp_sec, qt.theme_label,
+                    s.id AS session_id, s.name AS session_name, s.created_at
+                FROM quotes qt
+                JOIN sessions s ON s.id = qt.session_id
+                WHERE qt.account_id = :aid AND qt.text ILIKE :pattern
+                ORDER BY s.created_at DESC LIMIT 20
+            """
+            rows = await db.fetch_all(q, {"aid": account_id, "pattern": pattern})
+            for r in rows:
+                ts = r["timestamp_sec"]
+                ts_str = None
+                if ts is not None:
+                    h, rem = divmod(ts, 3600)
+                    m, s_ = divmod(rem, 60)
+                    ts_str = f"{h:02d}:{m:02d}:{s_:02d}"
+                results.append({
+                    "relevance_score": 0.90,
+                    "quote": r["text"],
+                    "speaker": r["speaker"],
+                    "timestamp": ts_str,
+                    "session_id": str(r["session_id"]),
+                    "session_name": r["session_name"],
+                    "date": str(r["created_at"])[:10] if r["created_at"] else None,
+                    "theme": r["theme_label"],
+                })
         except Exception as e:
-            return {"error": f"Search unavailable: {e}", "results": []}
+            print(f"[dispatch search] quotes query failed: {e}")
+        # Also search session metadata
+        try:
+            sq = """
+                SELECT id, name, findings, created_at
+                FROM sessions
+                WHERE account_id = :aid
+                  AND (name ILIKE :pattern OR findings::text ILIKE :pattern)
+                ORDER BY created_at DESC LIMIT 5
+            """
+            import json as _json
+            srows = await db.fetch_all(sq, {"aid": account_id, "pattern": pattern})
+            seen = {r["session_id"] for r in results}
+            for r in srows:
+                sid = str(r["id"])
+                if sid in seen:
+                    continue
+                findings_raw = r["findings"]
+                if isinstance(findings_raw, str):
+                    try:
+                        findings_raw = _json.loads(findings_raw)
+                    except Exception:
+                        findings_raw = []
+                first_quote = ""
+                if findings_raw and isinstance(findings_raw, list):
+                    sq_obj = findings_raw[0].get("supporting_quote", {}) if findings_raw else {}
+                    first_quote = sq_obj.get("text", "") if sq_obj else ""
+                results.append({
+                    "relevance_score": 0.70,
+                    "quote": first_quote,
+                    "speaker": None,
+                    "timestamp": None,
+                    "session_id": sid,
+                    "session_name": r["name"],
+                    "date": str(r["created_at"])[:10] if r["created_at"] else None,
+                    "theme": None,
+                    "synthesis_summary": f"Session matched query: '{query}'",
+                })
+        except Exception as e:
+            print(f"[dispatch search] sessions query failed: {e}")
+        results.sort(key=lambda x: x["relevance_score"], reverse=True)
+        return {"query": query, "results": results, "total": len(results)}
 
     elif tool_name == "list_sessions":
         limit = int(tool_input.get("limit", 20))
@@ -319,16 +389,77 @@ async def dispatch_tool(
         return {"sessions": sessions, "total": len(sessions)}
 
     elif tool_name == "generate_report":
-        import httpx
+        # Import the shared report logic
+        import os as _os, json as _json, io as _io, boto3 as _boto3
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        import base64 as _b64
+
+        sid = tool_input.get("session_id", "")
+        fmt = tool_input.get("format", "markdown")
+
+        row = await db.fetch_one(
+            "SELECT id, name, status, themes, findings FROM sessions WHERE id = :id AND account_id = :aid",
+            {"id": sid, "aid": account_id},
+        )
+        if not row:
+            return {"error": f"Session {sid} not found"}
+        if row["status"] != "ready":
+            return {"error": f"Session not ready (status: {row['status']})"}
+
+        themes = row["themes"] or []
+        findings = row["findings"] or []
+        if isinstance(themes, str):
+            try: themes = _json.loads(themes)
+            except Exception: themes = []
+        if isinstance(findings, str):
+            try: findings = _json.loads(findings)
+            except Exception: findings = []
+
+        quote_rows = await db.fetch_all(
+            "SELECT text, speaker, timestamp_sec, theme_label FROM quotes WHERE session_id = :sid ORDER BY timestamp_sec",
+            {"sid": sid},
+        )
+        quotes = []
+        for q in quote_rows:
+            ts = q["timestamp_sec"]
+            ts_str = None
+            if ts is not None:
+                h, rem = divmod(ts, 3600)
+                m, s_ = divmod(rem, 60)
+                ts_str = f"{h:02d}:{m:02d}:{s_:02d}"
+            quotes.append({"text": q["text"], "speaker": q["speaker"], "timestamp": ts_str, "theme": q["theme_label"] or "Other"})
+
+        data = {"themes": themes, "findings": findings, "quotes": quotes, "participant_count": 0}
+
+        from api.sessions import _build_markdown, _build_pdf
+        if fmt == "pdf":
+            report_bytes, ext, content_type = _build_pdf(sid, row["name"] or "Research Session", data)
+        else:
+            md_text = _build_markdown(sid, row["name"] or "Research Session", data)
+            report_bytes = md_text.encode("utf-8")
+            ext, content_type = "md", "text/markdown"
+
+        download_url = None
+        expires_at = None
         try:
-            async with httpx.AsyncClient(base_url=base_url, timeout=60) as client:
-                resp = await client.post(
-                    f"/v1/sessions/{tool_input['session_id']}/report",
-                    json={"format": tool_input.get("format", "markdown")},
-                )
-                return resp.json()
+            s3 = _boto3.client(
+                "s3",
+                endpoint_url=_os.environ["R2_ENDPOINT_URL"],
+                aws_access_key_id=_os.environ["R2_ACCESS_KEY_ID"],
+                aws_secret_access_key=_os.environ["R2_SECRET_ACCESS_KEY"],
+            )
+            bucket = _os.environ["R2_BUCKET_NAME"]
+            report_key = f"reports/{account_id}/{sid}.{ext}"
+            s3.put_object(Bucket=bucket, Key=report_key, Body=report_bytes, ContentType=content_type)
+            download_url = s3.generate_presigned_url(
+                "get_object", Params={"Bucket": bucket, "Key": report_key}, ExpiresIn=3600
+            )
+            expires_at = (_dt.now(_tz.utc) + _td(hours=1)).isoformat()
         except Exception as e:
-            return {"error": f"Report generation unavailable: {e}"}
+            print(f"[dispatch report] R2 upload failed: {e}")
+            download_url = f"data:{content_type};base64," + _b64.b64encode(report_bytes).decode()
+
+        return {"session_id": sid, "format": fmt, "download_url": download_url, "expires_at": expires_at}
 
     return {"error": f"Unknown tool: {tool_name}"}
 
