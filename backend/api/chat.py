@@ -602,3 +602,28 @@ async def list_conversations(
         {"aid": account_id, "limit": limit, "offset": offset},
     )
     return [dict(r) for r in rows]
+
+
+@router.get("/v1/conversations/{conversation_id}/messages")
+async def get_conversation_messages(
+    conversation_id: str,
+    request: Request,
+    account_id: str = Depends(get_account_id),
+):
+    db: Database = request.app.state.db
+    conv = await db.fetch_one(
+        "SELECT id FROM conversations WHERE id = :id AND account_id = :aid",
+        {"id": conversation_id, "aid": account_id},
+    )
+    if not conv:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    rows = await db.fetch_all(
+        """SELECT id, role, content, tool_name, created_at
+           FROM messages
+           WHERE conversation_id = :cid
+           ORDER BY created_at ASC""",
+        {"cid": conversation_id},
+    )
+    return [dict(r) for r in rows]
