@@ -9,6 +9,7 @@ boto3
 botocore
 httpx
 python-multipart
+modal
 reportlab
 stripe
 PyJWT

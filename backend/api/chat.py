@@ -755,15 +755,32 @@ async def upload_file(
          "name": session_name, "s3_key": s3_key},
     )
 
-    # Spawn Modal pipeline (lazy import — Modal auth not needed at startup)
+    # Spawn Modal pipeline
     try:
         import modal
         process_session = modal.Function.from_name(
             "sensecritiq-pipeline", "process_session"
         )
         await process_session.spawn.aio(session_id, s3_key, filename)
+        print(f"[upload] Modal job spawned for session {session_id}")
+    except ImportError:
+        print(f"[upload] ERROR: modal not installed — session {session_id} will stay queued")
+        # Mark as failed so the user gets honest feedback
+        await db.execute(
+            "UPDATE sessions SET status = 'failed' WHERE id = :id",
+            {"id": session_id},
+        )
+        return JSONResponse(
+            {"session_id": session_id, "status": "failed",
+             "error": "Pipeline unavailable — modal package not installed on server."},
+            status_code=500,
+        )
     except Exception as e:
         print(f"[upload] Modal spawn failed: {e}")
+        await db.execute(
+            "UPDATE sessions SET status = 'failed' WHERE id = :id",
+            {"id": session_id},
+        )
 
     return JSONResponse({"session_id": session_id, "status": "queued"})
 
