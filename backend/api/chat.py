@@ -528,7 +528,20 @@ async def stream_chat(
     """
 
     def sse(data: dict) -> str:
-        return f"data: {json.dumps(data)}\n\n"
+        import uuid as _uuid
+        import decimal as _decimal
+        import datetime as _datetime
+
+        def _default(obj):
+            if isinstance(obj, _uuid.UUID):
+                return str(obj)
+            if isinstance(obj, _decimal.Decimal):
+                return float(obj)
+            if isinstance(obj, (_datetime.datetime, _datetime.date)):
+                return obj.isoformat()
+            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+        return f"data: {json.dumps(data, default=_default)}\n\n"
 
     # Load history
     history = await load_history(db, conversation_id)
