@@ -276,11 +276,13 @@ async def generate_report(
     # Upload to R2
     report_key = f"reports/{account_id}/{session_id}.{ext}"
     try:
+        from botocore.config import Config as BotoConfig
         s3 = boto3.client(
             "s3",
             endpoint_url=os.environ["R2_ENDPOINT_URL"],
             aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
             aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+            config=BotoConfig(signature_version="s3v4"),
         )
         bucket = os.environ["R2_BUCKET_NAME"]
         s3.put_object(

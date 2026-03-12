@@ -12,6 +12,9 @@ Both resolve to an account_id that is used for all DB access.
 import json
 import os
 import asyncio
+import uuid as _uuid_mod
+import decimal as _decimal_mod
+import datetime as _datetime_mod
 from typing import AsyncIterator, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -22,6 +25,22 @@ import uuid
 from databases import Database
 
 router = APIRouter()
+
+
+# ── JSON serialiser that handles Postgres types ───────────────────────────────
+def _json_default(obj):
+    """Handles UUID, Decimal, datetime — all common Postgres return types."""
+    if isinstance(obj, _uuid_mod.UUID):
+        return str(obj)
+    if isinstance(obj, _decimal_mod.Decimal):
+        return float(obj)
+    if isinstance(obj, (_datetime_mod.datetime, _datetime_mod.date)):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def safe_json_dumps(obj) -> str:
+    return json.dumps(obj, default=_json_default)
 
 # ── Anthropic client ──────────────────────────────────────────────────────────
 _anthropic = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -451,11 +470,13 @@ async def dispatch_tool(
         download_url = None
         expires_at = None
         try:
+            from botocore.config import Config as _BotoConfig
             s3 = _boto3.client(
                 "s3",
                 endpoint_url=_os.environ["R2_ENDPOINT_URL"],
                 aws_access_key_id=_os.environ["R2_ACCESS_KEY_ID"],
                 aws_secret_access_key=_os.environ["R2_SECRET_ACCESS_KEY"],
+                config=_BotoConfig(signature_version="s3v4"),
             )
             bucket = _os.environ["R2_BUCKET_NAME"]
             report_key = f"reports/{account_id}/{sid}.{ext}"
@@ -537,20 +558,7 @@ async def stream_chat(
     """
 
     def sse(data: dict) -> str:
-        import uuid as _uuid
-        import decimal as _decimal
-        import datetime as _datetime
-
-        def _default(obj):
-            if isinstance(obj, _uuid.UUID):
-                return str(obj)
-            if isinstance(obj, _decimal.Decimal):
-                return float(obj)
-            if isinstance(obj, (_datetime.datetime, _datetime.date)):
-                return obj.isoformat()
-            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
-
-        return f"data: {json.dumps(data, default=_default)}\n\n"
+        return f"data: {safe_json_dumps(data)}\n\n"
 
     # Load history
     history = await load_history(db, conversation_id)
@@ -632,7 +640,7 @@ async def stream_chat(
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block["id"],
-                "content": json.dumps(result),
+                "content": safe_json_dumps(result),
             })
 
         messages.append({"role": "user", "content": tool_results})
@@ -701,11 +709,13 @@ async def upload_file(
     session_id = str(uuid.uuid4())
 
     # Upload to R2
+    from botocore.config import Config as BotoConfig
     s3 = boto3.client(
         "s3",
         endpoint_url=os.environ["R2_ENDPOINT_URL"],
         aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
         aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+        config=BotoConfig(signature_version="s3v4"),
     )
     s3_key = f"uploads/{account_id}/{session_id}/{filename}"
     s3.put_object(
