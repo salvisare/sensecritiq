@@ -261,7 +261,8 @@ async def dispatch_tool(
                          "Please use list_sessions to find your real sessions."
             }
 
-    elif tool_name == "get_session_status":
+    # ── Tool dispatch (separate chain — must not be elif of the UUID check above)
+    if tool_name == "get_session_status":
         sid = tool_input.get("session_id", "")
         row = await db.fetch_one(
             "SELECT id, status, quote_count, created_at, completed_at "
