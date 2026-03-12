@@ -42,6 +42,16 @@ def _json_default(obj):
 def safe_json_dumps(obj) -> str:
     return json.dumps(obj, default=_json_default)
 
+
+def _is_valid_uuid(val: str) -> bool:
+    """Return True only if val is a well-formed UUID string."""
+    try:
+        _uuid_mod.UUID(str(val))
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
 # ── Anthropic client ──────────────────────────────────────────────────────────
 _anthropic = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
@@ -240,6 +250,16 @@ async def dispatch_tool(
             "error": "File upload via tool not supported in web UI. "
                      "Use the attachment button to upload a file."
         }
+
+    # Validate any session_id before it hits the DB — stub IDs like "session-001"
+    # or "sess_a1b2c3d4" are not valid UUIDs and will cause asyncpg to crash.
+    if "session_id" in tool_input:
+        sid_candidate = tool_input.get("session_id", "")
+        if not _is_valid_uuid(sid_candidate):
+            return {
+                "error": f"Session ID '{sid_candidate}' is not a valid session. "
+                         "Please use list_sessions to find your real sessions."
+            }
 
     elif tool_name == "get_session_status":
         sid = tool_input.get("session_id", "")
