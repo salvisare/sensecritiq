@@ -1,0 +1,36 @@
+# Railway deploy ignore — strips ~820 MB of local deps from the upload
+
+# Portal — built and deployed separately via Vercel
+portal/node_modules/
+portal/build/
+portal/.next/
+
+# Python virtual environments
+backend/venv/
+mcp-server/venv/
+**/venv/
+**/.venv/
+
+# Uploaded research files (runtime data, not code)
+backend/uploads/
+
+# Python bytecode
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Dev / test artifacts
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/htmlcov/
+**/.coverage
+
+# OS / IDE
+**/.DS_Store
+**/.vscode/
+**/.idea/
+
+# Secrets
+.env
+**/*.env

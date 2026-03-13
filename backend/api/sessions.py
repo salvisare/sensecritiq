@@ -1,22 +1,26 @@
 """
 SenseCritiq — Real session endpoints.
-Replaces stub implementations for search and report generation.
 
-Registered first in main.py so it takes precedence over stubs.py for
-matching routes (/v1/search, /v1/sessions/{id}/report).
+Handles all session lifecycle: upload, list, status, synthesis, quotes,
+search, and report generation.  Registered before stubs.py in main.py
+so these real routes take precedence.
+
+Auth: Bearer scq_live_* API keys → SHA-256 verified against api_keys table.
+      Bearer Clerk JWT → verified via portal._verify_clerk_token.
 """
 
 import io
 import json
 import os
 import uuid
+import asyncio
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
 import boto3
 from databases import Database
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 
 router = APIRouter()
@@ -48,6 +52,674 @@ async def get_account_id(request: Request) -> str:
             raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
     from middleware.auth import verify_api_key
     return await verify_api_key(request)
+
+
+# ── R2 helper ─────────────────────────────────────────────────────────────────
+
+def _get_s3_client():
+    """Return a boto3 S3 client pointed at R2, or None if not configured."""
+    endpoint = os.environ.get("R2_ENDPOINT_URL")
+    key_id   = os.environ.get("R2_ACCESS_KEY_ID")
+    secret   = os.environ.get("R2_SECRET_ACCESS_KEY")
+    if not (endpoint and key_id and secret):
+        return None
+    from botocore.config import Config as BotoConfig
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=key_id,
+        aws_secret_access_key=secret,
+        config=BotoConfig(signature_version="s3v4"),
+    )
+
+
+# ── POST /v1/sessions ─────────────────────────────────────────────────────────
+
+@router.post("/sessions")
+async def create_session(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    account_id: str = Depends(get_account_id),
+):
+    """
+    Upload a research artifact and create a new processing session.
+    Accepts multipart/form-data with:
+        file         — the research artifact (audio, video, text, pdf, docx)
+        session_name — human-readable name
+        project_id   — optional project grouping
+        tags         — optional JSON array of strings
+    """
+    db: Database = request.app.state.db
+
+    # ── Parse multipart form ──────────────────────────────────────────────────
+    form = await request.form()
+    session_name: str = form.get("session_name", "Unnamed session")
+    project_id: Optional[str] = form.get("project_id") or None
+    tags_raw: str = form.get("tags", "[]")
+    file = form.get("file")
+
+    if not file:
+        raise HTTPException(status_code=400, detail="No file provided — include 'file' in multipart form")
+
+    filename: str = getattr(file, "filename", "upload")
+    file_bytes: bytes = await file.read() if hasattr(file, "read") else b""
+
+    # ── Parse tags ────────────────────────────────────────────────────────────
+    try:
+        tags = json.loads(tags_raw) if tags_raw else []
+    except Exception:
+        tags = []
+
+    # ── Create session record ─────────────────────────────────────────────────
+    session_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+
+    # Use only the core columns that definitely exist in the DB.
+    # project and tags are set via a follow-up UPDATE (they may not exist yet).
+    await db.execute(
+        """INSERT INTO sessions
+               (id, account_id, name, status, created_at)
+           VALUES
+               (:id, :account_id, :name, 'queued', :created_at)""",
+        {
+            "id":         session_id,
+            "account_id": account_id,
+            "name":       session_name,
+            "created_at": now,
+        },
+    )
+
+    # Best-effort optional fields (columns may not exist on older DB installs)
+    if project_id:
+        try:
+            await db.execute(
+                "UPDATE sessions SET project = :p WHERE id = :id",
+                {"p": project_id, "id": session_id},
+            )
+        except Exception:
+            pass
+
+    # ── Upload file to R2 ─────────────────────────────────────────────────────
+    s3_key = f"uploads/{account_id}/{session_id}/{filename}"
+    bucket = os.environ.get("R2_BUCKET_NAME", "sensecritiq-uploads")
+    s3     = _get_s3_client()
+
+    if s3 and file_bytes:
+        try:
+            s3.put_object(Bucket=bucket, Key=s3_key, Body=file_bytes)
+            await db.execute(
+                "UPDATE sessions SET file_s3_key = :key WHERE id = :id",
+                {"key": s3_key, "id": session_id},
+            )
+        except Exception as upload_err:
+            print(f"[sessions] R2 upload failed for {session_id}: {upload_err}")
+            # Don't abort — inline processing still possible
+
+    # ── Trigger processing pipeline ───────────────────────────────────────────
+    background_tasks.add_task(
+        _trigger_pipeline,
+        session_id=session_id,
+        s3_key=s3_key,
+        filename=filename,
+        file_bytes=file_bytes,
+        db_url=os.environ.get("DATABASE_URL", ""),
+    )
+
+    return {
+        "session_id":               session_id,
+        "session_name":             session_name,
+        "status":                   "queued",
+        "estimated_processing_time": "3–5 minutes",
+        "created_at":               now.isoformat(),
+    }
+
+
+async def _trigger_pipeline(
+    session_id: str,
+    s3_key: str,
+    filename: str,
+    file_bytes: bytes,
+    db_url: str,
+):
+    """
+    Background task: try to spawn Modal pipeline if credentials are present;
+    otherwise fall back to inline processing.
+    The inline path handles text/transcript files directly (no AssemblyAI needed).
+    """
+    # ── Try Modal only if credentials are explicitly configured ───────────────
+    if os.environ.get("MODAL_TOKEN_ID") and os.environ.get("MODAL_TOKEN_SECRET"):
+        try:
+            import modal
+            fn = modal.Function.from_name("sensecritiq-pipeline", "process_session")
+            fn.spawn(session_id, s3_key, filename)
+            print(f"[sessions] Modal pipeline spawned for {session_id}")
+            return
+        except Exception as modal_err:
+            print(f"[sessions] Modal spawn failed ({modal_err}), falling back to inline")
+    else:
+        print(f"[sessions] Modal not configured — running inline pipeline for {session_id}")
+
+    # ── Inline pipeline ───────────────────────────────────────────────────────
+    await _run_inline_pipeline(session_id, filename, file_bytes, db_url)
+
+
+async def _run_inline_pipeline(
+    session_id: str,
+    filename: str,
+    file_bytes: bytes,
+    db_url: str,
+):
+    """
+    Inline processing fallback for text-based research files.
+    Skips AssemblyAI for .txt/.md files (already transcripts).
+    For audio/video files, marks as failed with a helpful message.
+    """
+    from databases import Database as DB
+    import anthropic
+
+    database = DB(db_url)
+    await database.connect()
+
+    try:
+        await database.execute(
+            "UPDATE sessions SET status = 'processing' WHERE id = :id",
+            {"id": session_id},
+        )
+
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        audio_extensions = {"mp3", "mp4", "wav", "m4a", "aac", "ogg", "flac", "webm"}
+
+        if ext in audio_extensions:
+            # ── Audio: try AssemblyAI ─────────────────────────────────────────
+            aai_key = os.environ.get("ASSEMBLYAI_API_KEY")
+            if not aai_key:
+                raise RuntimeError(
+                    "Audio/video files require AssemblyAI. "
+                    "Set ASSEMBLYAI_API_KEY in Railway environment variables, "
+                    "or upload a .txt transcript instead."
+                )
+            transcript_text = await _transcribe_assemblyai(file_bytes, filename, aai_key)
+        else:
+            # ── Text/PDF/DOCX: extract text directly ──────────────────────────
+            transcript_text = _extract_text(file_bytes, ext)
+
+        if not transcript_text.strip():
+            raise RuntimeError("Could not extract any text from the uploaded file")
+
+        print(f"[pipeline] {session_id} — {len(transcript_text):,} chars of transcript")
+
+        # ── Filter with Claude Haiku ──────────────────────────────────────────
+        client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+        FILTER_SYSTEM = (
+            "You are a transcript cleaner for UX research. "
+            "Remove: consent scripts, pleasantries, scheduling talk, facilitator instructions, "
+            "technical setup issues, and any non-research meta-content. "
+            "Keep: all participant statements about their experience, opinions, confusion, "
+            "delight, or behaviour. Keep speaker labels and timestamps exactly as-is. "
+            "Return ONLY the cleaned transcript text — nothing else."
+        )
+
+        MAX_FILTER_CHARS = 80_000
+        chunks = [transcript_text[i:i + MAX_FILTER_CHARS] for i in range(0, len(transcript_text), MAX_FILTER_CHARS)]
+        filtered_parts = []
+        for i, chunk in enumerate(chunks):
+            resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=4096,
+                system=FILTER_SYSTEM,
+                messages=[{"role": "user", "content": chunk}],
+            )
+            filtered_parts.append(resp.content[0].text)
+
+        filtered_transcript = "\n".join(filtered_parts)
+        print(f"[pipeline] {session_id} — filtered to {len(filtered_transcript):,} chars")
+
+        # ── Synthesise with Claude Sonnet ─────────────────────────────────────
+        SYNTHESIS_SYSTEM = """You are a UX research analyst. You receive a cleaned research transcript
+and extract structured insights.
+
+Output ONLY valid JSON — no markdown, no explanation, no wrapper text.
+
+Schema:
+{
+  "themes": [
+    {
+      "id": "theme_001",
+      "label": "Short descriptive label (4-8 words)",
+      "description": "1-2 sentence summary of this theme",
+      "severity": "high | medium | low | positive",
+      "quote_count": <int>
+    }
+  ],
+  "key_findings": [
+    {
+      "finding": "A single, specific, actionable finding (1 sentence)",
+      "supporting_quote": {
+        "text": "Verbatim quote from transcript",
+        "speaker": "P1",
+        "timestamp": "HH:MM:SS"
+      }
+    }
+  ],
+  "quotes": [
+    {
+      "text": "Verbatim quote",
+      "speaker": "P1",
+      "timestamp_sec": <int seconds>,
+      "theme_label": "Label matching one of the themes above"
+    }
+  ]
+}
+
+Rules:
+- Every finding MUST cite a verbatim quote with speaker + timestamp.
+- Quotes must be exact words from the transcript — never paraphrased.
+- Aim for 3-7 themes and 5-15 key findings depending on session length.
+- Ignore pleasantries, filler, consent scripts, and facilitator meta-commentary."""
+
+        synthesis_resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=8192,
+            system=SYNTHESIS_SYSTEM,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Research session transcript:\n\n{filtered_transcript}\n\n"
+                    "Extract themes, key findings, and notable quotes as JSON."
+                ),
+            }],
+        )
+
+        synthesis_text = synthesis_resp.content[0].text.strip()
+        if synthesis_text.startswith("```"):
+            lines = synthesis_text.split("\n")
+            synthesis_text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
+        synthesis = json.loads(synthesis_text)
+
+        themes   = synthesis.get("themes", [])
+        findings = synthesis.get("key_findings", [])
+        quotes   = synthesis.get("quotes", [])
+        print(f"[pipeline] {session_id} — {len(themes)} themes, {len(findings)} findings, {len(quotes)} quotes")
+
+        # ── Fetch account_id ──────────────────────────────────────────────────
+        row = await database.fetch_one(
+            "SELECT account_id FROM sessions WHERE id = :id", {"id": session_id}
+        )
+        account_id = str(row["account_id"]) if row else None
+
+        # ── Store quotes ──────────────────────────────────────────────────────
+        for q in quotes:
+            qid = str(uuid.uuid4())
+            await database.execute(
+                """INSERT INTO quotes
+                       (id, session_id, account_id, text, speaker, timestamp_sec, theme_label, embedding_model)
+                   VALUES
+                       (:id, :sid, :aid, :text, :speaker, :ts, :theme_label, :model)
+                   ON CONFLICT DO NOTHING""",
+                {
+                    "id":          qid,
+                    "sid":         session_id,
+                    "aid":         account_id,
+                    "text":        q.get("text", ""),
+                    "speaker":     q.get("speaker"),
+                    "ts":          q.get("timestamp_sec"),
+                    "theme_label": q.get("theme_label"),
+                    "model":       "none",
+                },
+            )
+
+        # ── Mark session ready ────────────────────────────────────────────────
+        completed_at = datetime.now(timezone.utc)
+        await database.execute(
+            """UPDATE sessions
+               SET status = 'ready', themes = :themes, findings = :findings,
+                   quote_count = :qcount, completed_at = :completed_at
+               WHERE id = :id""",
+            {
+                "themes":       json.dumps(themes),
+                "findings":     json.dumps(findings),
+                "qcount":       len(quotes),
+                "completed_at": completed_at,
+                "id":           session_id,
+            },
+        )
+        print(f"[pipeline] {session_id} — status: ready ✓")
+
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[pipeline] {session_id} — FAILED: {e}\n{tb}")
+        # Store the error in findings JSONB so it's inspectable via API
+        try:
+            await database.execute(
+                """UPDATE sessions
+                   SET status = 'failed',
+                       findings = :err
+                   WHERE id = :id""",
+                {
+                    "err": json.dumps([{"error": str(e), "traceback": tb}]),
+                    "id": session_id,
+                },
+            )
+        except Exception as db_err:
+            print(f"[pipeline] could not write failure to DB: {db_err}")
+        raise
+    finally:
+        await database.disconnect()
+
+
+def _extract_text(file_bytes: bytes, ext: str) -> str:
+    """Extract plain text from uploaded file bytes."""
+    if ext in ("txt", "md", ""):
+        # Detect encoding
+        try:
+            return file_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return file_bytes.decode("latin-1", errors="replace")
+
+    if ext == "pdf":
+        try:
+            import pdfminer.high_level
+            return pdfminer.high_level.extract_text(io.BytesIO(file_bytes))
+        except ImportError:
+            pass
+        # Fallback: raw text extraction
+        text = file_bytes.decode("latin-1", errors="replace")
+        # Filter printable ASCII
+        return "".join(c if (32 <= ord(c) < 127 or c in "\n\r\t") else " " for c in text)
+
+    if ext in ("docx",):
+        try:
+            import docx
+            import zipfile
+            doc = docx.Document(io.BytesIO(file_bytes))
+            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        except ImportError:
+            pass
+        # Fallback: extract XML text from zip
+        try:
+            import zipfile, re
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+                xml = z.read("word/document.xml").decode("utf-8")
+            return re.sub(r"<[^>]+>", " ", xml)
+        except Exception:
+            return file_bytes.decode("latin-1", errors="replace")
+
+    # Unknown format: try UTF-8 decode
+    try:
+        return file_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return file_bytes.decode("latin-1", errors="replace")
+
+
+async def _transcribe_assemblyai(file_bytes: bytes, filename: str, api_key: str) -> str:
+    """Upload to AssemblyAI and poll until transcript is ready."""
+    import httpx, time
+
+    headers_auth = {"authorization": api_key}
+    headers_json = {"authorization": api_key, "content-type": "application/json"}
+
+    with httpx.Client(timeout=120) as http:
+        # Upload audio bytes
+        up = http.post(
+            "https://api.assemblyai.com/v2/upload",
+            headers=headers_auth,
+            content=file_bytes,
+        )
+        up.raise_for_status()
+        audio_url = up.json()["upload_url"]
+
+        # Submit job
+        job = http.post(
+            "https://api.assemblyai.com/v2/transcript",
+            headers=headers_json,
+            json={
+                "audio_url": audio_url,
+                "speech_model": "universal",
+                "speaker_labels": True,
+                "punctuate": True,
+                "format_text": True,
+            },
+        )
+        job.raise_for_status()
+        job_id = job.json()["id"]
+
+        # Poll
+        while True:
+            poll = http.get(
+                f"https://api.assemblyai.com/v2/transcript/{job_id}",
+                headers=headers_auth,
+            )
+            poll.raise_for_status()
+            result = poll.json()
+            if result["status"] == "completed":
+                break
+            elif result["status"] == "error":
+                raise RuntimeError(f"AssemblyAI error: {result.get('error')}")
+            time.sleep(3)
+
+    # Build diarised text
+    lines = []
+    utterances = result.get("utterances") or []
+    if utterances:
+        for utt in utterances:
+            ts = utt.get("start", 0) // 1000
+            h, r = divmod(ts, 3600)
+            m, s = divmod(r, 60)
+            lines.append(f"Speaker {utt['speaker']} [{h:02d}:{m:02d}:{s:02d}]: {utt['text']}")
+    else:
+        lines = [result.get("text", "")]
+
+    return "\n".join(lines)
+
+
+# ── GET /v1/sessions ──────────────────────────────────────────────────────────
+
+@router.get("/sessions")
+async def list_sessions(
+    request: Request,
+    limit: int = 20,
+    offset: int = 0,
+    project_id: Optional[str] = None,
+    account_id: str = Depends(get_account_id),
+):
+    """List research sessions for the authenticated account."""
+    db: Database = request.app.state.db
+
+    q = """
+        SELECT id, name, project AS project_id, status,
+               quote_count, created_at, completed_at
+        FROM sessions
+        WHERE account_id = :aid
+    """
+    params: dict = {"aid": account_id}
+
+    if project_id:
+        q += " AND project = :pid"
+        params["pid"] = project_id
+
+    q += " ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
+    params["limit"]  = limit
+    params["offset"] = offset
+
+    rows = await db.fetch_all(q, params)
+
+    sessions = []
+    for r in rows:
+        sessions.append({
+            "id":           str(r["id"]),
+            "name":         r["name"] or "Unnamed session",
+            "project":      r["project_id"],
+            "status":       r["status"],
+            "quote_count":  r["quote_count"] or 0,
+            "created_at":   r["created_at"].isoformat() if r["created_at"] else None,
+            "completed_at": r["completed_at"].isoformat() if r["completed_at"] else None,
+        })
+
+    # Count total
+    count_row = await db.fetch_one(
+        "SELECT COUNT(*) as cnt FROM sessions WHERE account_id = :aid",
+        {"aid": account_id},
+    )
+    total = count_row["cnt"] if count_row else len(sessions)
+
+    return {"sessions": sessions, "total": total}
+
+
+# ── GET /v1/sessions/{session_id}/status ──────────────────────────────────────
+
+@router.get("/sessions/{session_id}/status")
+async def get_session_status(
+    session_id: str,
+    request: Request,
+    account_id: str = Depends(get_account_id),
+):
+    """Get the processing status of a session."""
+    db: Database = request.app.state.db
+
+    row = await db.fetch_one(
+        """SELECT id, status, quote_count, created_at, completed_at
+           FROM sessions
+           WHERE id = :id AND account_id = :aid""",
+        {"id": session_id, "aid": account_id},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    status_order = {"queued": 0, "processing": 50, "ready": 100, "failed": 0}
+    progress = status_order.get(row["status"], 0)
+
+    response: dict = {
+        "session_id":   str(row["id"]),
+        "status":       row["status"],
+        "progress_pct": progress,
+        "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
+    }
+
+    # If failed, surface the stored error so callers can see why
+    if row["status"] == "failed":
+        try:
+            err_row = await db.fetch_one(
+                "SELECT findings FROM sessions WHERE id = :id",
+                {"id": session_id},
+            )
+            if err_row and err_row["findings"]:
+                findings = err_row["findings"]
+                if isinstance(findings, str):
+                    findings = json.loads(findings)
+                if isinstance(findings, list) and findings and "error" in findings[0]:
+                    response["error"] = findings[0].get("error", "Unknown error")
+        except Exception:
+            pass
+
+    return response
+
+
+# ── GET /v1/sessions/{session_id}/synthesis ───────────────────────────────────
+
+@router.get("/sessions/{session_id}/synthesis")
+async def get_synthesis(
+    session_id: str,
+    request: Request,
+    account_id: str = Depends(get_account_id),
+):
+    """Retrieve synthesised themes and key findings for a completed session."""
+    db: Database = request.app.state.db
+
+    row = await db.fetch_one(
+        """SELECT id, name, status, themes, findings, quote_count
+           FROM sessions
+           WHERE id = :id AND account_id = :aid""",
+        {"id": session_id, "aid": account_id},
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if row["status"] not in ("ready",):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Session not ready (status: {row['status']}). "
+                   f"Use get_session_status to poll for completion.",
+        )
+
+    themes = row["themes"] or []
+    findings = row["findings"] or []
+    if isinstance(themes, str):
+        try: themes = json.loads(themes)
+        except: themes = []
+    if isinstance(findings, str):
+        try: findings = json.loads(findings)
+        except: findings = []
+
+    # Count distinct speakers from quotes table
+    speaker_row = await db.fetch_one(
+        "SELECT COUNT(DISTINCT speaker) as cnt FROM quotes WHERE session_id = :sid",
+        {"sid": session_id},
+    )
+    participant_count = speaker_row["cnt"] if speaker_row else 0
+
+    return {
+        "session_id":        str(row["id"]),
+        "session_name":      row["name"] or "Unnamed session",
+        "participant_count": participant_count,
+        "quote_count":       row["quote_count"] or 0,
+        "themes":            themes,
+        "key_findings":      findings,
+    }
+
+
+# ── GET /v1/sessions/{session_id}/quotes ──────────────────────────────────────
+
+@router.get("/sessions/{session_id}/quotes")
+async def get_quotes(
+    session_id: str,
+    request: Request,
+    theme_id: Optional[str] = None,
+    account_id: str = Depends(get_account_id),
+):
+    """Retrieve verbatim quotes from a session, optionally filtered by theme."""
+    db: Database = request.app.state.db
+
+    # Verify session belongs to this account
+    session_row = await db.fetch_one(
+        "SELECT id FROM sessions WHERE id = :id AND account_id = :aid",
+        {"id": session_id, "aid": account_id},
+    )
+    if not session_row:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    q = """
+        SELECT id, text, speaker, timestamp_sec, theme_label
+        FROM quotes
+        WHERE session_id = :sid
+    """
+    params: dict = {"sid": session_id}
+
+    if theme_id:
+        q += " AND theme_label ILIKE :theme"
+        params["theme"] = f"%{theme_id}%"
+
+    q += " ORDER BY timestamp_sec ASC NULLS LAST LIMIT 200"
+    rows = await db.fetch_all(q, params)
+
+    quotes = []
+    for r in rows:
+        ts = r["timestamp_sec"]
+        ts_str = None
+        if ts is not None:
+            h, rem = divmod(ts, 3600)
+            m, s   = divmod(rem, 60)
+            ts_str = f"{h:02d}:{m:02d}:{s:02d}"
+        quotes.append({
+            "id":          str(r["id"]),
+            "text":        r["text"],
+            "speaker":     r["speaker"],
+            "timestamp":   ts_str,
+            "theme_id":    r["theme_label"],
+            "theme_label": r["theme_label"],
+        })
+
+    return {"quotes": quotes, "total": len(quotes)}
 
 
 # ── POST /v1/search ───────────────────────────────────────────────────────────

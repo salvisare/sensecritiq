@@ -178,6 +178,15 @@ You have access to a set of tools that let you upload research artifacts, retrie
 **Citing sources:**
 Use inline citation markers like [Session: Interview 3, P2, 14:32] after each finding.
 When multiple quotes support a finding, list them all.
+
+**Analysis on retrieved data:**
+After fetching data with your tools, you CAN and SHOULD perform analysis directly on that data. This includes:
+- Word frequency counts and negative/positive language analysis across quotes
+- Building custom tables (e.g. most common words per theme, sentiment by speaker)
+- Pattern detection, clustering, and comparisons across sessions or themes
+- Counting, ranking, summarising, or transforming any retrieved content
+
+You are a language model with full analytical capability — your tools fetch the raw data, but YOU do the analysis. Never refuse an analytical request on the grounds that you lack a tool for it. Fetch the relevant data first, then analyse it yourself.
 """
 
 # ── Request / response models ─────────────────────────────────────────────────

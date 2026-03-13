@@ -1,24 +1,46 @@
 # Python
 __pycache__/
 *.pyc
-venv/
-.venv/
+*.pyo
+*.pyd
+.Python
 *.egg-info/
-
-# Environment files — never commit these
-.env
-.env.*
-
-# Build
-build/
 dist/
-node_modules/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.env
+.env.local
 
-# Railway / Vercel
-.vercel/
-.railway/
+# Node / Portal
+portal/node_modules/
+portal/.next/
+portal/build/
+portal/dist/
+
+# MCP server
+mcp-server/venv/
+
+# Dev tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
 
 # IDE
-.DS_Store
 .vscode/
-.mcpregistry_github_token
+.idea/
+*.swp
+*.swo
+
+# Secrets
+*.env
+.env.*

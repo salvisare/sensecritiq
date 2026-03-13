@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+pydantic
+databases[asyncpg]
+asyncpg
+python-dotenv
+anthropic
+boto3
+botocore
+httpx
+python-multipart
+modal
+reportlab
+stripe
+PyJWT
+cryptography
