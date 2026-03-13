@@ -149,65 +149,86 @@ async def process_session(session_id: str, s3_key: str, filename: str):
         file_bytes = buf.read()
         print(f"[pipeline] {session_id} — downloaded {len(file_bytes):,} bytes from R2")
 
-        # ── 3. Transcribe with AssemblyAI (direct HTTP API) ──────────────────
+        # ── 3. Get transcript text ────────────────────────────────────────────
+        # Route by file type: text files extract directly, audio/video use AssemblyAI
         import httpx, time as _time
-        aai_key = os.environ["ASSEMBLYAI_API_KEY"]
-        aai_headers = {"authorization": aai_key, "content-type": "application/json"}
 
-        # Upload audio bytes
-        with httpx.Client(timeout=120) as http:
-            up = http.post(
-                "https://api.assemblyai.com/v2/upload",
-                headers={"authorization": aai_key},
-                content=file_bytes,
-            )
-            up.raise_for_status()
-            audio_url = up.json()["upload_url"]
-            print(f"[pipeline] {session_id} — uploaded to AssemblyAI: {audio_url}")
+        TEXT_EXTENSIONS = {"txt", "md", "vtt", "srt", "csv"}
+        DOC_EXTENSIONS  = {"pdf", "docx", "doc"}
+        AUDIO_EXTENSIONS = {"mp3", "mp4", "wav", "m4a", "aac", "ogg", "flac", "webm", "mov"}
 
-            # Submit transcription job
-            job = http.post(
-                "https://api.assemblyai.com/v2/transcript",
-                headers=aai_headers,
-                json={
-                    "audio_url": audio_url,
-                    "speech_models": ["universal-2"],
-                    "speaker_labels": True,
-                    "punctuate": True,
-                    "format_text": True,
-                },
-            )
-            job.raise_for_status()
-            job_id = job.json()["id"]
-            print(f"[pipeline] {session_id} — transcription job {job_id} submitted")
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
-            # Poll until complete
-            while True:
-                poll = http.get(
-                    f"https://api.assemblyai.com/v2/transcript/{job_id}",
-                    headers=aai_headers,
-                )
-                poll.raise_for_status()
-                result = poll.json()
-                status = result["status"]
-                if status == "completed":
-                    break
-                elif status == "error":
-                    raise RuntimeError(f"AssemblyAI error: {result.get('error')}")
-                _time.sleep(3)
+        if ext in TEXT_EXTENSIONS:
+            # ── Plain text — decode directly ──────────────────────────────────
+            try:
+                raw_transcript = file_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                raw_transcript = file_bytes.decode("latin-1", errors="replace")
+            print(f"[pipeline] {session_id} — text file, {len(raw_transcript):,} chars")
 
-        # Build diarised text: "Speaker A [00:01:23]: text..."
-        raw_lines = []
-        utterances = result.get("utterances") or []
-        if utterances:
-            for utt in utterances:
-                ts = _fmt_timestamp((utt["start"] or 0) // 1000)
-                raw_lines.append(f"Speaker {utt['speaker']} [{ts}]: {utt['text']}")
+        elif ext in DOC_EXTENSIONS:
+            # ── PDF / DOCX — extract text ─────────────────────────────────────
+            raw_transcript = _extract_doc_text(file_bytes, ext)
+            print(f"[pipeline] {session_id} — doc file ({ext}), {len(raw_transcript):,} chars")
+
         else:
-            raw_lines = [result.get("text") or ""]
+            # ── Audio / Video — transcribe with AssemblyAI ────────────────────
+            aai_key = os.environ["ASSEMBLYAI_API_KEY"]
+            aai_headers = {"authorization": aai_key, "content-type": "application/json"}
 
-        raw_transcript = "\n".join(raw_lines)
-        print(f"[pipeline] {session_id} — transcribed {len(raw_transcript):,} chars")
+            with httpx.Client(timeout=120) as http:
+                up = http.post(
+                    "https://api.assemblyai.com/v2/upload",
+                    headers={"authorization": aai_key},
+                    content=file_bytes,
+                )
+                up.raise_for_status()
+                audio_url = up.json()["upload_url"]
+                print(f"[pipeline] {session_id} — uploaded to AssemblyAI: {audio_url}")
+
+                job = http.post(
+                    "https://api.assemblyai.com/v2/transcript",
+                    headers=aai_headers,
+                    json={
+                        "audio_url": audio_url,
+                        "speech_model": "universal",
+                        "speaker_labels": True,
+                        "punctuate": True,
+                        "format_text": True,
+                    },
+                )
+                job.raise_for_status()
+                job_id = job.json()["id"]
+                print(f"[pipeline] {session_id} — transcription job {job_id} submitted")
+
+                while True:
+                    poll = http.get(
+                        f"https://api.assemblyai.com/v2/transcript/{job_id}",
+                        headers=aai_headers,
+                    )
+                    poll.raise_for_status()
+                    result = poll.json()
+                    status = result["status"]
+                    if status == "completed":
+                        break
+                    elif status == "error":
+                        raise RuntimeError(f"AssemblyAI error: {result.get('error')}")
+                    _time.sleep(3)
+
+            utterances = result.get("utterances") or []
+            if utterances:
+                raw_lines = [
+                    f"Speaker {utt['speaker']} [{_fmt_timestamp((utt['start'] or 0) // 1000)}]: {utt['text']}"
+                    for utt in utterances
+                ]
+            else:
+                raw_lines = [result.get("text") or ""]
+            raw_transcript = "\n".join(raw_lines)
+            print(f"[pipeline] {session_id} — transcribed {len(raw_transcript):,} chars")
+
+        if not raw_transcript.strip():
+            raise RuntimeError(f"No text could be extracted from '{filename}'")
 
         # Save transcript key (optional — for future retrieval)
         transcript_key = f"transcripts/{session_id}/transcript.txt"
@@ -346,6 +367,37 @@ def _fmt_timestamp(seconds: int) -> str:
     m = (seconds % 3600) // 60
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _extract_doc_text(file_bytes: bytes, ext: str) -> str:
+    """Extract plain text from PDF or DOCX bytes."""
+    import io
+    if ext == "pdf":
+        try:
+            import pdfminer.high_level
+            return pdfminer.high_level.extract_text(io.BytesIO(file_bytes))
+        except Exception:
+            pass
+        # Fallback: raw decode
+        return file_bytes.decode("latin-1", errors="replace")
+
+    if ext in ("docx", "doc"):
+        try:
+            import docx
+            doc = docx.Document(io.BytesIO(file_bytes))
+            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        except Exception:
+            pass
+        # Fallback: extract XML from zip
+        try:
+            import zipfile, re
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+                xml = z.read("word/document.xml").decode("utf-8")
+            return re.sub(r"<[^>]+>", " ", xml)
+        except Exception:
+            pass
+
+    return file_bytes.decode("utf-8", errors="replace")
 
 
 def _chunk_text(text: str, max_chars: int) -> list[str]:
