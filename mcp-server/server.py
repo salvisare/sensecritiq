@@ -56,24 +56,24 @@ async def _dispatch(name, args):
         with open(file_path, "rb") as f:
             file_bytes = f.read()
         async with httpx.AsyncClient(timeout=120.0) as client:
-            r = await client.post(f"{API_BASE_URL}/sessions", headers={k:v for k,v in HEADERS.items() if k != "Content-Type"}, files={"file": (os.path.basename(file_path), file_bytes)}, data={"session_name": args["session_name"], "project_id": args.get("project_id",""), "tags": json.dumps(args.get("tags",[]))})
+            r = await client.post(f"{API_BASE_URL}/v1/sessions", headers={k:v for k,v in HEADERS.items() if k != "Content-Type"}, files={"file": (os.path.basename(file_path), file_bytes)}, data={"session_name": args["session_name"], "project_id": args.get("project_id",""), "tags": json.dumps(args.get("tags",[]))})
             r.raise_for_status(); return r.json()
     elif name == "get_session_status":
-        return await _request("GET", f"/sessions/{args['session_id']}/status")
+        return await _request("GET", f"/v1/sessions/{args['session_id']}/status")
     elif name == "get_synthesis":
-        return await _request("GET", f"/sessions/{args['session_id']}/synthesis")
+        return await _request("GET", f"/v1/sessions/{args['session_id']}/synthesis")
     elif name == "get_quotes":
         params = {"theme_id": args["theme_id"]} if "theme_id" in args else {}
-        return await _request("GET", f"/sessions/{args['session_id']}/quotes", params=params)
+        return await _request("GET", f"/v1/sessions/{args['session_id']}/quotes", params=params)
     elif name == "search_research":
         payload = {k: args[k] for k in ["query","project_id","date_from","date_to"] if k in args}
-        return await _request("POST", "/search", json=payload)
+        return await _request("POST", "/v1/search", json=payload)
     elif name == "list_sessions":
         params = {"limit": args.get("limit",20), "offset": args.get("offset",0)}
         if "project_id" in args: params["project_id"] = args["project_id"]
-        return await _request("GET", "/sessions", params=params)
+        return await _request("GET", "/v1/sessions", params=params)
     elif name == "generate_report":
-        return await _request("POST", f"/sessions/{args['session_id']}/report", json={"format": args.get("format","markdown")})
+        return await _request("POST", f"/v1/sessions/{args['session_id']}/report", json={"format": args.get("format","markdown")})
     else:
         return {"error": f"Unknown tool: {name}"}
 
