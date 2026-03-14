@@ -126,9 +126,24 @@ async def process_session(session_id: str, s3_key: str, filename: str):
     import openai
     from databases import Database
 
+    import asyncio as _asyncio
     db_url = os.environ["DATABASE_URL"]
     database = Database(db_url)
-    await database.connect()
+
+    # Retry DB connect with exponential backoff — Railway PostgreSQL can time
+    # out on cold Modal container SSL handshake.
+    _max_attempts = 4
+    for _attempt in range(1, _max_attempts + 1):
+        try:
+            await database.connect()
+            break
+        except Exception as _conn_err:
+            if _attempt == _max_attempts:
+                raise
+            _wait = 2 ** _attempt          # 2s, 4s, 8s
+            print(f"[pipeline] {session_id} — DB connect attempt {_attempt} failed "
+                  f"({_conn_err!r}), retrying in {_wait}s…")
+            await _asyncio.sleep(_wait)
 
     try:
         # ── 1. Mark as processing ────────────────────────────────────────────
