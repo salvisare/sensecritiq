@@ -150,6 +150,13 @@ async def process_session(session_id: str, s3_key: str, filename: str):
         await _update_session(database, session_id, status="processing")
         print(f"[pipeline] {session_id} — status: processing")
 
+        # Fetch account_id early — needed for usage_log inserts throughout pipeline
+        _acct_row = await database.fetch_one(
+            "SELECT account_id FROM sessions WHERE id = :id",
+            {"id": session_id},
+        )
+        account_id = str(_acct_row["account_id"]) if _acct_row else None
+
         # ── 2. Download file from R2 ─────────────────────────────────────────
         s3 = boto3.client(
             "s3",
@@ -341,42 +348,81 @@ async def process_session(session_id: str, s3_key: str, filename: str):
         print(f"[pipeline] {session_id} — {len(themes)} themes, {len(findings)} findings, "
               f"{len(quotes)} quotes")
 
-        # ── 6. Generate embeddings (OpenAI) ──────────────────────────────────
+        # ── 6. Generate embeddings (OpenAI text-embedding-3-small) ───────────
         oa = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
         quote_texts = [q["text"] for q in quotes if q.get("text")]
+        embeddings: list[list[float] | None] = [None] * len(quotes)
 
-        # Embeddings skipped — pgvector not yet enabled on this PostgreSQL instance.
-        # Add vector(1536) column and re-enable once pgvector is installed.
-        print(f"[pipeline] {session_id} — skipping embeddings (pgvector not enabled)")
+        if quote_texts:
+            try:
+                BATCH = 100  # OpenAI allows up to 2048 inputs; keep batches small
+                all_embeddings: list[list[float]] = []
+                for i in range(0, len(quote_texts), BATCH):
+                    batch = quote_texts[i : i + BATCH]
+                    resp = oa.embeddings.create(
+                        model="text-embedding-3-small",
+                        input=batch,
+                    )
+                    all_embeddings.extend([e.embedding for e in resp.data])
+
+                # Map back to original quotes list (quotes without text stay None)
+                text_idx = 0
+                for i, q in enumerate(quotes):
+                    if q.get("text"):
+                        embeddings[i] = all_embeddings[text_idx]
+                        text_idx += 1
+
+                print(f"[pipeline] {session_id} — generated {len(all_embeddings)} embeddings")
+            except Exception as emb_err:
+                print(f"[pipeline] {session_id} — embeddings failed (non-fatal): {emb_err}")
 
         # ── 7. Store quotes in DB ─────────────────────────────────────────────
-        # Fetch account_id for this session
-        row = await database.fetch_one(
-            "SELECT account_id FROM sessions WHERE id = :id",
-            {"id": session_id},
-        )
-        account_id = str(row["account_id"]) if row else None
-
-        for q in quotes:
+        import json as _json
+        for i, q in enumerate(quotes):
             qid = str(uuid.uuid4())
-            await database.execute(
-                """INSERT INTO quotes
-                   (id, session_id, account_id, text, speaker, timestamp_sec,
-                    theme_label, embedding_model)
-                   VALUES (:id, :sid, :aid, :text, :speaker, :ts,
-                           :theme_label, :model)
-                   ON CONFLICT DO NOTHING""",
-                {
-                    "id": qid,
-                    "sid": session_id,
-                    "aid": account_id,
-                    "text": q.get("text", ""),
-                    "speaker": q.get("speaker"),
-                    "ts": q.get("timestamp_sec"),
-                    "theme_label": q.get("theme_label"),
-                    "model": "text-embedding-3-small",
-                },
-            )
+            emb = embeddings[i]
+            # Serialize embedding as pgvector string format: "[x1,x2,...]"
+            emb_str = _json.dumps(emb) if emb is not None else None
+
+            if emb_str is not None:
+                await database.execute(
+                    """INSERT INTO quotes
+                       (id, session_id, account_id, text, speaker, timestamp_sec,
+                        theme_label, embedding_model, embedding)
+                       VALUES (:id, :sid, :aid, :text, :speaker, :ts,
+                               :theme_label, :model, :emb::vector)
+                       ON CONFLICT DO NOTHING""",
+                    {
+                        "id": qid,
+                        "sid": session_id,
+                        "aid": account_id,
+                        "text": q.get("text", ""),
+                        "speaker": q.get("speaker"),
+                        "ts": q.get("timestamp_sec"),
+                        "theme_label": q.get("theme_label"),
+                        "model": "text-embedding-3-small",
+                        "emb": emb_str,
+                    },
+                )
+            else:
+                await database.execute(
+                    """INSERT INTO quotes
+                       (id, session_id, account_id, text, speaker, timestamp_sec,
+                        theme_label, embedding_model)
+                       VALUES (:id, :sid, :aid, :text, :speaker, :ts,
+                               :theme_label, :model)
+                       ON CONFLICT DO NOTHING""",
+                    {
+                        "id": qid,
+                        "sid": session_id,
+                        "aid": account_id,
+                        "text": q.get("text", ""),
+                        "speaker": q.get("speaker"),
+                        "ts": q.get("timestamp_sec"),
+                        "theme_label": q.get("theme_label"),
+                        "model": "text-embedding-3-small",
+                    },
+                )
 
         # ── 8. Update session → ready ─────────────────────────────────────────
         import datetime
