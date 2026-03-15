@@ -390,7 +390,7 @@ async def process_session(session_id: str, s3_key: str, filename: str):
                        (id, session_id, account_id, text, speaker, timestamp_sec,
                         theme_label, embedding_model, embedding)
                        VALUES (:id, :sid, :aid, :text, :speaker, :ts,
-                               :theme_label, :model, :emb::vector)
+                               :theme_label, :model, CAST(:emb AS vector))
                        ON CONFLICT DO NOTHING""",
                     {
                         "id": qid,
