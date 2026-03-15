@@ -372,12 +372,12 @@ async def dispatch_tool(
                 SELECT
                     qt.text, qt.speaker, qt.timestamp_sec, qt.theme_label,
                     s.id AS session_id, s.name AS session_name, s.created_at,
-                    1 - (qt.embedding <=> :qvec::vector) AS similarity
+                    1 - (qt.embedding <=> CAST(:qvec AS vector)) AS similarity
                 FROM quotes qt
                 JOIN sessions s ON s.id = qt.session_id
                 WHERE qt.account_id = :aid
                   AND qt.embedding IS NOT NULL
-                ORDER BY qt.embedding <=> :qvec::vector
+                ORDER BY qt.embedding <=> CAST(:qvec AS vector)
                 LIMIT 15
             """
             params: dict = {"aid": account_id, "qvec": query_vec}
