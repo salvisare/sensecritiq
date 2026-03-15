@@ -14,6 +14,7 @@ from sqlalchemy import text
 router = APIRouter(prefix="/billing", tags=["billing"])
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # Maps Stripe price IDs → internal plan names and session quotas
@@ -97,9 +98,14 @@ async def customer_portal(request: Request):
 
 @router.post("/webhook")
 async def stripe_webhook(request: Request):
-    WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-    print(f"[stripe] WEBHOOK_SECRET loaded: {bool(WEBHOOK_SECRET)} prefix: {WEBHOOK_SECRET[:10] if WEBHOOK_SECRET else 'EMPTY'}")
-    
+    """
+    Receives Stripe webhook events and updates account plan in DB.
+
+    Key events handled:
+    - checkout.session.completed  → activate subscription
+    - customer.subscription.updated → plan change / renewal
+    - customer.subscription.deleted → downgrade to free
+    """
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
 
