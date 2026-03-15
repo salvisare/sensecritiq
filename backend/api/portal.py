@@ -26,6 +26,18 @@ def _get_db():
     url = DATABASE_URL
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    # Strip URL params that asyncpg doesn't accept as keyword args.
+    # SSL is handled via connect_args below, not via URL params.
+    for _old, _new in [
+        ("?sslmode=require&channel_binding=require", ""),
+        ("?sslmode=require", ""),
+        ("&sslmode=require", ""),
+        ("&channel_binding=require", ""),
+        ("?channel_binding=require", ""),
+        ("?ssl=true", ""),
+        ("&ssl=true", ""),
+    ]:
+        url = url.replace(_old, _new)
     engine = create_async_engine(url, connect_args={"ssl": "require"})
     return sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
