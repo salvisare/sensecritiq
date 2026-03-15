@@ -309,12 +309,18 @@ async def dispatch_tool(
             themes = _json.loads(themes)
         if isinstance(findings, str):
             findings = _json.loads(findings)
+        participant_row = await db.fetch_one(
+            "SELECT COUNT(DISTINCT speaker) AS cnt FROM quotes WHERE session_id = :sid",
+            {"sid": sid},
+        )
+        participant_count = int(participant_row["cnt"]) if participant_row else 0
         return {
             "session_id": sid,
             "session_name": row["name"],
             "themes": themes or [],
             "key_findings": findings or [],
             "quote_count": row["quote_count"] or 0,
+            "participant_count": participant_count,
         }
 
     elif tool_name == "get_quotes":
@@ -487,7 +493,12 @@ async def dispatch_tool(
                 ts_str = f"{h:02d}:{m:02d}:{s_:02d}"
             quotes.append({"text": q["text"], "speaker": q["speaker"], "timestamp": ts_str, "theme": q["theme_label"] or "Other"})
 
-        data = {"themes": themes, "findings": findings, "quotes": quotes, "participant_count": 0}
+        participant_row = await db.fetch_one(
+            "SELECT COUNT(DISTINCT speaker) AS cnt FROM quotes WHERE session_id = :sid",
+            {"sid": sid},
+        )
+        participant_count = int(participant_row["cnt"]) if participant_row else 0
+        data = {"themes": themes, "findings": findings, "quotes": quotes, "participant_count": participant_count}
 
         from api.sessions import _build_markdown, _build_pdf
         if fmt == "pdf":
