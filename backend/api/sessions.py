@@ -943,6 +943,19 @@ async def generate_report(
 
     session_name = row["name"] or "Research Session"
 
+    # Notion export — create page via API and return URL directly
+    if fmt == "notion":
+        try:
+            notion_url = await _push_to_notion(session_name, data)
+            return {
+                "session_id":   session_id,
+                "format":       "notion",
+                "download_url": notion_url,
+                "expires_at":   None,
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Notion export failed: {e}")
+
     # Generate report content
     if fmt == "pdf":
         report_bytes, ext, content_type = _build_pdf(session_id, session_name, data)
@@ -1182,3 +1195,150 @@ def _build_pdf(session_id: str, session_name: str, data: dict):
     doc.build(story)
     buf.seek(0)
     return buf.read(), "pdf", "application/pdf"
+
+
+async def _push_to_notion(session_name: str, data: dict) -> str:
+    """Create a Notion page from report data. Returns the Notion page URL."""
+    import httpx
+    from datetime import timezone
+
+    notion_token = os.environ.get("NOTION_API_KEY", "")
+    parent_page_id = os.environ.get("NOTION_PARENT_PAGE_ID", "")
+    if not notion_token or not parent_page_id:
+        raise ValueError("NOTION_API_KEY and NOTION_PARENT_PAGE_ID env vars are required")
+
+    themes    = data.get("themes", [])
+    findings  = data.get("findings", [])
+    quotes    = data.get("quotes", [])
+    generated = datetime.now(timezone.utc).strftime("%B %d, %Y")
+
+    def txt(content: str, bold=False, color=None) -> dict:
+        run: dict = {"type": "text", "text": {"content": content}}
+        if bold or color:
+            run["annotations"] = {}
+            if bold:
+                run["annotations"]["bold"] = True
+            if color:
+                run["annotations"]["color"] = color
+        return run
+
+    def heading2(content: str) -> dict:
+        return {"object": "block", "type": "heading_2",
+                "heading_2": {"rich_text": [txt(content)]}}
+
+    def heading3(content: str) -> dict:
+        return {"object": "block", "type": "heading_3",
+                "heading_3": {"rich_text": [txt(content)]}}
+
+    def para(rich_text: list) -> dict:
+        return {"object": "block", "type": "paragraph",
+                "paragraph": {"rich_text": rich_text}}
+
+    def quote_block(content: str) -> dict:
+        return {"object": "block", "type": "quote",
+                "quote": {"rich_text": [txt(content)]}}
+
+    def callout(content: str, emoji: str = "💡") -> dict:
+        return {"object": "block", "type": "callout",
+                "callout": {"rich_text": [txt(content)], "icon": {"type": "emoji", "emoji": emoji}}}
+
+    def divider() -> dict:
+        return {"object": "block", "type": "divider", "divider": {}}
+
+    # Build blocks
+    blocks: list = []
+
+    # Meta
+    blocks.append(para([txt(f"Generated: {generated}  |  Quotes: {len(quotes)}", color="gray")]))
+    blocks.append(divider())
+
+    # Themes
+    if themes:
+        blocks.append(heading2("Themes"))
+        for i, theme in enumerate(themes, 1):
+            label       = theme.get("label", f"Theme {i}")
+            description = theme.get("description", "")
+            severity    = theme.get("severity", "")
+            emoji       = {"high": "🔴", "medium": "🟡", "positive": "🟢", "low": "🟢"}.get(severity, "⚪")
+            qcount      = theme.get("quote_count", "")
+            header      = f"{emoji} {label}" + (f"  ({qcount} quotes)" if qcount else "")
+            blocks.append(heading3(header))
+            if description:
+                blocks.append(para([txt(description)]))
+
+    # Key Findings
+    if findings:
+        blocks.append(divider())
+        blocks.append(heading2("Key Findings"))
+        for i, finding in enumerate(findings, 1):
+            text = finding.get("finding", finding.get("text", ""))
+            blocks.append(para([txt(f"{i}. {text}", bold=True)]))
+            sq = finding.get("supporting_quote", {})
+            if sq:
+                qt  = sq.get("text", "")
+                spk = sq.get("speaker", "")
+                ts  = sq.get("timestamp", "")
+                if qt:
+                    blocks.append(quote_block(f'"{qt}"'))
+                    attr = " — ".join(filter(None, [spk, ts]))
+                    if attr:
+                        blocks.append(para([txt(f"— {attr}", color="gray")]))
+
+    # Quotes by theme
+    if quotes:
+        blocks.append(divider())
+        blocks.append(heading2("Verbatim Quotes"))
+        groups: dict = {}
+        for q in quotes:
+            groups.setdefault(q.get("theme", "Other"), []).append(q)
+        for theme_label, tq in groups.items():
+            blocks.append(heading3(theme_label))
+            for q in tq:
+                qtext = q.get("text", "")
+                spk   = q.get("speaker", "")
+                ts    = q.get("timestamp", "")
+                if qtext:
+                    blocks.append(quote_block(f'"{qtext}"'))
+                    attr = " — ".join(filter(None, [spk, ts]))
+                    if attr:
+                        blocks.append(para([txt(f"— {attr}", color="gray")]))
+
+    blocks.append(divider())
+    blocks.append(para([txt("Generated by SenseCritiq — sensecritiq.com", color="gray")]))
+
+    headers = {
+        "Authorization": f"Bearer {notion_token}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        # Create the page with first 100 blocks (Notion API limit per request)
+        create_resp = await client.post(
+            "https://api.notion.com/v1/pages",
+            headers=headers,
+            json={
+                "parent": {"page_id": parent_page_id},
+                "properties": {
+                    "title": [{"type": "text", "text": {"content": session_name}}]
+                },
+                "children": blocks[:100],
+            },
+        )
+        create_resp.raise_for_status()
+        page_id  = create_resp.json()["id"]
+        page_url = create_resp.json()["url"]
+
+        # Append remaining blocks in batches of 100
+        remaining = blocks[100:]
+        while remaining:
+            batch = remaining[:100]
+            remaining = remaining[100:]
+            append_resp = await client.patch(
+                f"https://api.notion.com/v1/blocks/{page_id}/children",
+                headers=headers,
+                json={"children": batch},
+            )
+            append_resp.raise_for_status()
+
+    return page_url
