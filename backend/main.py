@@ -34,6 +34,16 @@ app.add_middleware(
 
 # ── Database ──────────────────────────────────────────────────────────────────
 DATABASE_URL = os.environ["DATABASE_URL"]
+# asyncpg does not accept sslmode= — convert to ssl=true.
+# Also strip channel_binding= which asyncpg doesn't support.
+for _old, _new in [
+    ("?sslmode=require&channel_binding=require", "?ssl=true"),
+    ("?sslmode=require", "?ssl=true"),
+    ("&sslmode=require", "&ssl=true"),
+    ("&channel_binding=require", ""),
+    ("?channel_binding=require", ""),
+]:
+    DATABASE_URL = DATABASE_URL.replace(_old, _new)
 database = Database(DATABASE_URL)
 
 @app.on_event("startup")
