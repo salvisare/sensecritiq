@@ -388,10 +388,10 @@ async def dispatch_tool(
                 )
                 params["pid"] = tool_input["project_id"]
             if "date_from" in tool_input:
-                vec_q = vec_q.replace("LIMIT 15", "AND s.created_at >= :df::date LIMIT 15")
+                vec_q = vec_q.replace("LIMIT 15", "AND s.created_at >= CAST(:df AS date) LIMIT 15")
                 params["df"] = tool_input["date_from"]
             if "date_to" in tool_input:
-                vec_q = vec_q.replace("LIMIT 15", "AND s.created_at <= :dt::date LIMIT 15")
+                vec_q = vec_q.replace("LIMIT 15", "AND s.created_at <= CAST(:dt AS date) LIMIT 15")
                 params["dt"] = tool_input["date_to"]
 
             rows = await db.fetch_all(vec_q, params)
