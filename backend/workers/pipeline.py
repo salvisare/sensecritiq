@@ -264,6 +264,15 @@ async def process_session(session_id: str, s3_key: str, filename: str):
         else:
             chunks = [raw_transcript]
 
+        # Token cost constants (USD per token)
+        HAIKU_IN   = 0.80  / 1_000_000   # $0.80 per 1M input tokens
+        HAIKU_OUT  = 4.00  / 1_000_000   # $4.00 per 1M output tokens
+        SONNET_IN  = 3.00  / 1_000_000   # $3.00 per 1M input tokens
+        SONNET_OUT = 15.00 / 1_000_000   # $15.00 per 1M output tokens
+
+        haiku_input_tokens  = 0
+        haiku_output_tokens = 0
+
         filtered_parts = []
         for i, chunk in enumerate(chunks):
             print(f"[pipeline] {session_id} — filtering chunk {i+1}/{len(chunks)}")
@@ -274,6 +283,18 @@ async def process_session(session_id: str, s3_key: str, filename: str):
                 messages=[{"role": "user", "content": chunk}],
             )
             filtered_parts.append(resp.content[0].text)
+            haiku_input_tokens  += resp.usage.input_tokens
+            haiku_output_tokens += resp.usage.output_tokens
+
+        # Log Haiku usage
+        haiku_tokens = haiku_input_tokens + haiku_output_tokens
+        haiku_cost   = haiku_input_tokens * HAIKU_IN + haiku_output_tokens * HAIKU_OUT
+        await database.execute(
+            """INSERT INTO usage_log (id, account_id, session_id, action, tokens_used, cost_usd, created_at)
+               VALUES (:id, :aid, :sid, :action, :tokens, :cost, NOW())""",
+            {"id": str(uuid.uuid4()), "aid": account_id, "sid": session_id,
+             "action": "haiku_filter", "tokens": haiku_tokens, "cost": round(haiku_cost, 6)},
+        )
 
         filtered_transcript = "\n".join(filtered_parts)
         print(f"[pipeline] {session_id} — filtered to {len(filtered_transcript):,} chars "
@@ -292,6 +313,16 @@ async def process_session(session_id: str, s3_key: str, filename: str):
                     "Extract themes, key findings, and notable quotes as JSON."
                 ),
             }],
+        )
+
+        # Log Sonnet usage
+        sonnet_tokens = synthesis_resp.usage.input_tokens + synthesis_resp.usage.output_tokens
+        sonnet_cost   = synthesis_resp.usage.input_tokens * SONNET_IN + synthesis_resp.usage.output_tokens * SONNET_OUT
+        await database.execute(
+            """INSERT INTO usage_log (id, account_id, session_id, action, tokens_used, cost_usd, created_at)
+               VALUES (:id, :aid, :sid, :action, :tokens, :cost, NOW())""",
+            {"id": str(uuid.uuid4()), "aid": account_id, "sid": session_id,
+             "action": "sonnet_synthesis", "tokens": sonnet_tokens, "cost": round(sonnet_cost, 6)},
         )
 
         synthesis_text = synthesis_resp.content[0].text.strip()
