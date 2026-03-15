@@ -103,6 +103,30 @@ async def _ensure_schema(db: Database):
     except Exception:
         pass
 
+    # ── conversations table (Phase 2 chat UI) ─────────────────────────────────
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+            account_id  UUID        NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            title       TEXT,
+            session_id  UUID,
+            created_at  TIMESTAMP   DEFAULT NOW(),
+            updated_at  TIMESTAMP   DEFAULT NOW()
+        )
+    """)
+
+    # ── messages table (Phase 2 chat UI) ──────────────────────────────────────
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+            conversation_id  UUID        NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            role             TEXT        NOT NULL,
+            content          TEXT        NOT NULL,
+            created_at       TIMESTAMP   DEFAULT NOW()
+        )
+    """)
+    print("[schema] conversations + messages tables ready")
+
 @app.on_event("shutdown")
 async def shutdown():
     await database.disconnect()
