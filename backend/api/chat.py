@@ -349,23 +349,52 @@ async def dispatch_tool(
         return {"quotes": quotes, "total": len(quotes)}
 
     elif tool_name == "search_research":
-        # Direct DB search — ILIKE across quotes and session names
+        import json as _json
+        import openai as _openai
+
         query: str = tool_input.get("query", "").strip()
         if not query:
             return {"query": query, "results": [], "total": 0}
-        pattern = f"%{query}%"
+
         results = []
+        used_vector_search = False
+
+        # ── Try vector (semantic) search first ───────────────────────────────
         try:
-            q = """
+            _oa = _openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+            q_resp = _oa.embeddings.create(
+                model="text-embedding-3-small",
+                input=query,
+            )
+            query_vec = _json.dumps(q_resp.data[0].embedding)
+
+            vec_q = """
                 SELECT
                     qt.text, qt.speaker, qt.timestamp_sec, qt.theme_label,
-                    s.id AS session_id, s.name AS session_name, s.created_at
+                    s.id AS session_id, s.name AS session_name, s.created_at,
+                    1 - (qt.embedding <=> :qvec::vector) AS similarity
                 FROM quotes qt
                 JOIN sessions s ON s.id = qt.session_id
-                WHERE qt.account_id = :aid AND qt.text ILIKE :pattern
-                ORDER BY s.created_at DESC LIMIT 20
+                WHERE qt.account_id = :aid
+                  AND qt.embedding IS NOT NULL
+                ORDER BY qt.embedding <=> :qvec::vector
+                LIMIT 15
             """
-            rows = await db.fetch_all(q, {"aid": account_id, "pattern": pattern})
+            params: dict = {"aid": account_id, "qvec": query_vec}
+            if "project_id" in tool_input:
+                vec_q = vec_q.replace(
+                    "AND qt.embedding IS NOT NULL",
+                    "AND qt.embedding IS NOT NULL AND s.project = :pid",
+                )
+                params["pid"] = tool_input["project_id"]
+            if "date_from" in tool_input:
+                vec_q = vec_q.replace("LIMIT 15", "AND s.created_at >= :df::date LIMIT 15")
+                params["df"] = tool_input["date_from"]
+            if "date_to" in tool_input:
+                vec_q = vec_q.replace("LIMIT 15", "AND s.created_at <= :dt::date LIMIT 15")
+                params["dt"] = tool_input["date_to"]
+
+            rows = await db.fetch_all(vec_q, params)
             for r in rows:
                 ts = r["timestamp_sec"]
                 ts_str = None
@@ -374,7 +403,7 @@ async def dispatch_tool(
                     m, s_ = divmod(rem, 60)
                     ts_str = f"{h:02d}:{m:02d}:{s_:02d}"
                 results.append({
-                    "relevance_score": 0.90,
+                    "relevance_score": round(float(r["similarity"]), 4),
                     "quote": r["text"],
                     "speaker": r["speaker"],
                     "timestamp": ts_str,
@@ -382,11 +411,52 @@ async def dispatch_tool(
                     "session_name": r["session_name"],
                     "date": str(r["created_at"])[:10] if r["created_at"] else None,
                     "theme": r["theme_label"],
+                    "search_type": "semantic",
                 })
+            if results:
+                used_vector_search = True
+                print(f"[dispatch search] vector search returned {len(results)} results")
         except Exception as e:
-            print(f"[dispatch search] quotes query failed: {e}")
-        # Also search session metadata
+            print(f"[dispatch search] vector search failed, falling back to ILIKE: {e}")
+
+        # ── Fallback: ILIKE keyword search ───────────────────────────────────
+        if not used_vector_search:
+            pattern = f"%{query}%"
+            try:
+                kw_q = """
+                    SELECT
+                        qt.text, qt.speaker, qt.timestamp_sec, qt.theme_label,
+                        s.id AS session_id, s.name AS session_name, s.created_at
+                    FROM quotes qt
+                    JOIN sessions s ON s.id = qt.session_id
+                    WHERE qt.account_id = :aid AND qt.text ILIKE :pattern
+                    ORDER BY s.created_at DESC LIMIT 20
+                """
+                rows = await db.fetch_all(kw_q, {"aid": account_id, "pattern": pattern})
+                for r in rows:
+                    ts = r["timestamp_sec"]
+                    ts_str = None
+                    if ts is not None:
+                        h, rem = divmod(ts, 3600)
+                        m, s_ = divmod(rem, 60)
+                        ts_str = f"{h:02d}:{m:02d}:{s_:02d}"
+                    results.append({
+                        "relevance_score": 0.90,
+                        "quote": r["text"],
+                        "speaker": r["speaker"],
+                        "timestamp": ts_str,
+                        "session_id": str(r["session_id"]),
+                        "session_name": r["session_name"],
+                        "date": str(r["created_at"])[:10] if r["created_at"] else None,
+                        "theme": r["theme_label"],
+                        "search_type": "keyword",
+                    })
+            except Exception as e:
+                print(f"[dispatch search] ILIKE search failed: {e}")
+
+        # ── Session metadata search (always runs as supplement) ───────────────
         try:
+            pattern = f"%{query}%"
             sq = """
                 SELECT id, name, findings, created_at
                 FROM sessions
@@ -394,12 +464,11 @@ async def dispatch_tool(
                   AND (name ILIKE :pattern OR findings::text ILIKE :pattern)
                 ORDER BY created_at DESC LIMIT 5
             """
-            import json as _json
             srows = await db.fetch_all(sq, {"aid": account_id, "pattern": pattern})
-            seen = {r["session_id"] for r in results}
+            seen_sessions = {r["session_id"] for r in results}
             for r in srows:
                 sid = str(r["id"])
-                if sid in seen:
+                if sid in seen_sessions:
                     continue
                 findings_raw = r["findings"]
                 if isinstance(findings_raw, str):
@@ -421,11 +490,18 @@ async def dispatch_tool(
                     "date": str(r["created_at"])[:10] if r["created_at"] else None,
                     "theme": None,
                     "synthesis_summary": f"Session matched query: '{query}'",
+                    "search_type": "keyword",
                 })
         except Exception as e:
-            print(f"[dispatch search] sessions query failed: {e}")
+            print(f"[dispatch search] session metadata search failed: {e}")
+
         results.sort(key=lambda x: x["relevance_score"], reverse=True)
-        return {"query": query, "results": results, "total": len(results)}
+        return {
+            "query": query,
+            "results": results,
+            "total": len(results),
+            "search_type": "semantic" if used_vector_search else "keyword",
+        }
 
     elif tool_name == "list_sessions":
         limit = int(tool_input.get("limit", 20))

@@ -44,7 +44,16 @@ async def startup():
 
 
 async def _ensure_schema(db: Database):
-    """Create any missing tables that Phase 2 requires."""
+    """Create any missing tables and columns. Runs on every startup — all ops are idempotent."""
+
+    # ── pgvector extension ────────────────────────────────────────────────────
+    try:
+        await db.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        print("[schema] pgvector extension enabled")
+    except Exception as e:
+        print(f"[schema] pgvector not available ({e}) — vector search will be disabled")
+
+    # ── quotes table ──────────────────────────────────────────────────────────
     await db.execute("""
         CREATE TABLE IF NOT EXISTS quotes (
             id               UUID        PRIMARY KEY,
@@ -58,11 +67,31 @@ async def _ensure_schema(db: Database):
             created_at       TIMESTAMP   DEFAULT NOW()
         )
     """)
-    # Ensure project column exists on sessions (may have been named differently)
+
+    # ── add embedding column if not present ───────────────────────────────────
+    try:
+        await db.execute(
+            "ALTER TABLE quotes ADD COLUMN IF NOT EXISTS embedding vector(1536)"
+        )
+        print("[schema] quotes.embedding column ready")
+    except Exception as e:
+        print(f"[schema] could not add embedding column ({e}) — pgvector may not be enabled")
+
+    # ── HNSW index for fast cosine similarity search ──────────────────────────
+    try:
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS quotes_embedding_hnsw_idx
+            ON quotes USING hnsw (embedding vector_cosine_ops)
+        """)
+        print("[schema] HNSW index ready")
+    except Exception as e:
+        print(f"[schema] could not create HNSW index ({e})")
+
+    # ── project column on sessions ────────────────────────────────────────────
     try:
         await db.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS project TEXT")
     except Exception:
-        pass  # Column already exists or DDL restricted
+        pass
 
 @app.on_event("shutdown")
 async def shutdown():
