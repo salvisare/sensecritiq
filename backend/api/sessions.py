@@ -651,12 +651,12 @@ async def get_synthesis(
         try: findings = json.loads(findings)
         except: findings = []
 
-    # Count distinct speakers from quotes table
+    # Count distinct non-null speakers from quotes table
     speaker_row = await db.fetch_one(
-        "SELECT COUNT(DISTINCT speaker) as cnt FROM quotes WHERE session_id = :sid",
+        "SELECT COUNT(DISTINCT speaker) AS cnt FROM quotes WHERE session_id = :sid AND speaker IS NOT NULL",
         {"sid": session_id},
     )
-    participant_count = speaker_row["cnt"] if speaker_row else 0
+    participant_count = int(speaker_row["cnt"]) if speaker_row else 0
 
     return {
         "session_id":        str(row["id"]),
@@ -927,11 +927,18 @@ async def generate_report(
             "theme": q["theme_label"] or "Other",
         })
 
+    # Count distinct speakers from quotes
+    speaker_row = await db.fetch_one(
+        "SELECT COUNT(DISTINCT speaker) AS cnt FROM quotes WHERE session_id = :sid AND speaker IS NOT NULL",
+        {"sid": session_id},
+    )
+    participant_count = int(speaker_row["cnt"]) if speaker_row else 0
+
     data = {
         "themes": themes,
         "findings": findings,
         "quotes": quotes,
-        "participant_count": 0,  # not tracked yet
+        "participant_count": participant_count,
     }
 
     session_name = row["name"] or "Research Session"

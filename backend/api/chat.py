@@ -310,7 +310,7 @@ async def dispatch_tool(
         if isinstance(findings, str):
             findings = _json.loads(findings)
         participant_row = await db.fetch_one(
-            "SELECT COUNT(DISTINCT speaker) AS cnt FROM quotes WHERE session_id = :sid",
+            "SELECT COUNT(DISTINCT speaker) AS cnt FROM quotes WHERE session_id = :sid AND speaker IS NOT NULL",
             {"sid": sid},
         )
         participant_count = int(participant_row["cnt"]) if participant_row else 0
@@ -570,7 +570,7 @@ async def dispatch_tool(
             quotes.append({"text": q["text"], "speaker": q["speaker"], "timestamp": ts_str, "theme": q["theme_label"] or "Other"})
 
         participant_row = await db.fetch_one(
-            "SELECT COUNT(DISTINCT speaker) AS cnt FROM quotes WHERE session_id = :sid",
+            "SELECT COUNT(DISTINCT speaker) AS cnt FROM quotes WHERE session_id = :sid AND speaker IS NOT NULL",
             {"sid": sid},
         )
         participant_count = int(participant_row["cnt"]) if participant_row else 0
