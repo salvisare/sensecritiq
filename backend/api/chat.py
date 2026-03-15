@@ -576,7 +576,16 @@ async def dispatch_tool(
         participant_count = int(participant_row["cnt"]) if participant_row else 0
         data = {"themes": themes, "findings": findings, "quotes": quotes, "participant_count": participant_count}
 
-        from api.sessions import _build_markdown, _build_pdf
+        from api.sessions import _build_markdown, _build_pdf, _push_to_notion
+
+        # Notion export — push to Notion API and return page URL directly
+        if fmt == "notion":
+            try:
+                notion_url = await _push_to_notion(row["name"] or "Research Session", data)
+                return {"session_id": sid, "format": "notion", "download_url": notion_url, "expires_at": None}
+            except Exception as e:
+                return {"error": f"Notion export failed: {e}"}
+
         if fmt == "pdf":
             report_bytes, ext, content_type = _build_pdf(sid, row["name"] or "Research Session", data)
         else:
