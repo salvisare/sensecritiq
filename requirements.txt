@@ -5,6 +5,7 @@ databases[asyncpg]
 asyncpg
 python-dotenv
 anthropic
+openai
 boto3
 botocore
 httpx
